@@ -22,6 +22,7 @@ import { Type } from "@sinclair/typebox";
 import { Text, type AutocompleteItem, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
 import { readdirSync, readFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
+import { homedir } from "node:os";
 import { join, resolve } from "path";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
@@ -106,31 +107,52 @@ function parseAgentFile(filePath: string): AgentDef | null {
 	}
 }
 
+const DEBUG_SCAN = true;
+
 function scanAgentDirs(cwd: string): AgentDef[] {
 	const dirs = [
 		join(cwd, "agents"),
 		join(cwd, ".claude", "agents"),
 		join(cwd, ".pi", "agents"),
+		// Global fallback — always scan home directory agents
+		join(homedir(), ".pi", "agents"),
 	];
 
 	const agents: AgentDef[] = [];
 	const seen = new Set<string>();
 
-	for (const dir of dirs) {
-		if (!existsSync(dir)) continue;
+	function scanDir(dir: string, depth: number = 0) {
+		if (!existsSync(dir)) {
+			if (DEBUG_SCAN) console.error(`[agent-team] dir not found: ${dir}`);
+			return;
+		}
 		try {
-			for (const file of readdirSync(dir)) {
-				if (!file.endsWith(".md")) continue;
-				const fullPath = resolve(dir, file);
+			for (const file of readdirSync(dir, { withFileTypes: true })) {
+				if (file.isDirectory() && depth < 1) {
+					// Recurse one level deep into subdirectories (e.g. pi-pi/)
+					scanDir(join(dir, file.name), depth + 1);
+					continue;
+				}
+				if (!file.isFile() && !file.isSymbolicLink()) continue;
+				if (!file.name.endsWith(".md")) continue;
+				const fullPath = resolve(dir, file.name);
 				const def = parseAgentFile(fullPath);
 				if (def && !seen.has(def.name.toLowerCase())) {
+					if (DEBUG_SCAN) console.error(`[agent-team] found agent: ${def.name} (${fullPath})`);
 					seen.add(def.name.toLowerCase());
 					agents.push(def);
 				}
 			}
-		} catch {}
+		} catch (e) {
+			console.error(`[agent-team] error scanning ${dir}:`, e);
+		}
 	}
 
+	for (const dir of dirs) {
+		scanDir(dir, 0);
+	}
+
+	if (DEBUG_SCAN) console.error(`[agent-team] total agents found: ${agents.length}`);
 	return agents;
 }
 
@@ -157,7 +179,10 @@ export default function (pi: ExtensionAPI) {
 		allAgentDefs = scanAgentDirs(cwd);
 
 		// Load teams from .pi/agents/teams.yaml
-		const teamsPath = join(cwd, ".pi", "agents", "teams.yaml");
+		let teamsPath = join(cwd, ".pi", "agents", "teams.yaml");
+		if (!existsSync(teamsPath)) {
+			teamsPath = join(homedir(), ".pi", "agents", "teams.yaml");
+		}
 		if (existsSync(teamsPath)) {
 			try {
 				teams = parseTeamsYaml(readFileSync(teamsPath, "utf-8"));
@@ -349,9 +374,10 @@ export default function (pi: ExtensionAPI) {
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: "openrouter/google/gemini-3-flash-preview");
 
-		// Session file for this agent
+		// Session file for this agent — scoped to main orchestrator session
+		const mainSessionId = ctx.sessionManager.getSessionId();
 		const agentKey = state.def.name.toLowerCase().replace(/\s+/g, "-");
-		const agentSessionFile = join(sessionDir, `${agentKey}.json`);
+		const agentSessionFile = join(sessionDir, `${mainSessionId}-${agentKey}.json`);
 
 		// Build args — first run creates session, subsequent runs resume
 		const args = [
@@ -377,7 +403,7 @@ export default function (pi: ExtensionAPI) {
 		return new Promise((resolve) => {
 			const proc = spawn("pi", args, {
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env },
+				env: { ...process.env, PI_CACHE_RETENTION: "long" },
 			});
 
 			let buffer = "";
@@ -688,14 +714,16 @@ ${agentCatalog}`,
 		contextWindow = _ctx.model?.contextWindow || 0;
 
 		// Wipe old agent session files so subagents start fresh
-		const sessDir = join(_ctx.cwd, ".pi", "agent-sessions");
-		if (existsSync(sessDir)) {
-			for (const f of readdirSync(sessDir)) {
-				if (f.endsWith(".json")) {
-					try { unlinkSync(join(sessDir, f)); } catch {}
-				}
-			}
-		}
+		// DISABLED: preserving session history allows subagents to reuse
+		// cache across orchestrator runs, improving LLM provider cache hit rates.
+		// const sessDir = join(_ctx.cwd, ".pi", "agent-sessions");
+		// if (existsSync(sessDir)) {
+		// 	for (const f of readdirSync(sessDir)) {
+		// 		if (f.endsWith(".json")) {
+		// 			try { unlinkSync(join(sessDir, f)); } catch {}
+		// 		}
+		// 	}
+		// }
 
 		loadAgents(_ctx.cwd);
 
