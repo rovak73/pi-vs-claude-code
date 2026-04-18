@@ -135,7 +135,6 @@ function scanAgentDirs(cwd: string): AgentDef[] {
 
 	function scanDir(dir: string, depth: number = 0) {
 		if (!existsSync(dir)) {
-			if (DEBUG_SCAN) console.error(`[agent-team] dir not found: ${dir}`);
 			return;
 		}
 		try {
@@ -150,13 +149,11 @@ function scanAgentDirs(cwd: string): AgentDef[] {
 				const fullPath = resolve(dir, file.name);
 				const def = parseAgentFile(fullPath);
 				if (def && !seen.has(def.name.toLowerCase())) {
-					if (DEBUG_SCAN) console.error(`[agent-team] found agent: ${def.name} (${fullPath})`);
 					seen.add(def.name.toLowerCase());
 					agents.push(def);
 				}
 			}
 		} catch (e) {
-			console.error(`[agent-team] error scanning ${dir}:`, e);
 		}
 	}
 
@@ -164,7 +161,6 @@ function scanAgentDirs(cwd: string): AgentDef[] {
 		scanDir(dir, 0);
 	}
 
-	if (DEBUG_SCAN) console.error(`[agent-team] total agents found: ${agents.length}`);
 	return agents;
 }
 
@@ -210,6 +206,7 @@ export default function (pi: ExtensionAPI) {
 	let activeTeamName = "";
 	let gridCols = 2;
 	let widgetCtx: any;
+	let gridText: any;
 	let sessionDir = "";
 	let contextWindow = 0;
 
@@ -333,16 +330,20 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function updateWidget() {
+		if (gridText) gridText.invalidate();
+	}
+
+	function setupWidget() {
 		if (!widgetCtx) return;
 
 		widgetCtx.ui.setWidget("agent-team", (_tui: any, theme: any) => {
-			const text = new Text("", 0, 1);
+			gridText = new Text("", 0, 1);
 
 			return {
 				render(width: number): string[] {
 					if (agentStates.size === 0) {
-						text.setText(theme.fg("dim", "No agents found. Add .md files to agents/"));
-						return text.render(width);
+						gridText.setText(theme.fg("dim", "No agents found. Add .md files to agents/"));
+						return gridText.render(width);
 					}
 
 					const cols = Math.min(gridCols, agentStates.size);
@@ -366,11 +367,11 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					const output = rows.map(cols => cols.join(" ".repeat(gap)));
-					text.setText(output.join("\n"));
-					return text.render(width);
+					gridText.setText(output.join("\n"));
+					return gridText.render(width);
 				},
 				invalidate() {
-					text.invalidate();
+					if (gridText) gridText.invalidate();
 				},
 			};
 		});
@@ -382,9 +383,9 @@ export default function (pi: ExtensionAPI) {
 		agentName: string,
 		task: string,
 		ctx: any,
+		onUpdate?: (update: any) => void,
 	): Promise<{ output: string; exitCode: number; elapsed: number }> {
 		const key = agentName.toLowerCase();
-		console.error(`[agent-team-permodel] dispatchAgent called: agent="${agentName}", key="${key}", available=[${Array.from(agentStates.keys()).join(", ")}], EPHEMERAL_SUBAGENTS="${process.env.PI_EPHEMERAL_SUBAGENTS}"`);
 		const state = agentStates.get(key);
 		if (!state) {
 			return Promise.resolve({
@@ -414,6 +415,12 @@ export default function (pi: ExtensionAPI) {
 		state.timer = setInterval(() => {
 			state.elapsed = Date.now() - startTime;
 			updateWidget();
+			if (onUpdate) {
+				onUpdate({
+					content: [{ type: "text", text: `Dispatching to ${agentName}...` }],
+					details: { agent: agentName, task, status: "running", elapsed: state.elapsed },
+				});
+			}
 		}, 1000);
 
 		const model = state.def.model || (ctx.model
@@ -423,7 +430,6 @@ export default function (pi: ExtensionAPI) {
 		// Ephemeral subagent mode: supports "true" (fresh sessions) and "summarized" (summary injection)
 		const ephemeralMode = process.env.PI_EPHEMERAL_SUBAGENTS || "false";
 		const ephemeral = ephemeralMode === "true" || ephemeralMode === "summarized";
-		console.error(`[agent-team-permodel] PI_EPHEMERAL_SUBAGENTS="${process.env.PI_EPHEMERAL_SUBAGENTS ?? "(unset)"}", ephemeralMode="${ephemeralMode}", ephemeral=${ephemeral}`);
 
 		// Session file for this agent — scoped to main orchestrator session
 		const mainSessionId = ctx.sessionManager.getSessionId();
@@ -470,22 +476,17 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// When in summarized mode, inject prior turn summaries + instructions into --append-system-prompt
-		console.error(`[agent-team-permodel] about to check ephemeralMode: "${ephemeralMode}"`);
 		if (ephemeralMode === "summarized") {
-			console.error(`[agent-team-permodel] entered summarized branch for agent "${agentName}"`);
 			const summariesPath = join(sessionDir, `${mainSessionId}-${agentKey}-summaries.json`);
-			console.error(`[agent-team-permodel] summariesPath=${summariesPath}`);
 			let summaries: TurnSummary[] = [];
 			if (existsSync(summariesPath)) {
 				try {
 					summaries = JSON.parse(readFileSync(summariesPath, "utf-8"));
 				} catch {}
 			}
-			console.error(`[agent-team-permodel] found ${summaries.length} summaries at ${summariesPath}`);
 
 			// Find the index of --append-system-prompt to modify its value
 			const sysPromptIdx = args.indexOf("--append-system-prompt");
-			console.error(`[agent-team-permodel] --append-system-prompt found in args: ${sysPromptIdx >= 0}`);
 			if (sysPromptIdx >= 0) {
 				let currentSystemPrompt = args[sysPromptIdx + 1] || "";
 
@@ -516,7 +517,6 @@ export default function (pi: ExtensionAPI) {
 				currentSystemPrompt += formatSummaryInstructions(currentTurn);
 
 				args[sysPromptIdx + 1] = currentSystemPrompt;
-				console.error(`[agent-team-permodel] system prompt modified, final length=${currentSystemPrompt.length}`);
 			}
 		}
 
@@ -556,10 +556,22 @@ export default function (pi: ExtensionAPI) {
 								const last = full.split("\n").filter((l: string) => l.trim()).pop() || "";
 								state.lastWork = last;
 								updateWidget();
+								if (onUpdate) {
+									onUpdate({
+										content: [{ type: "text", text: full }],
+										details: { agent: agentName, task, status: "running", elapsed: Date.now() - startTime },
+									});
+								}
 							}
 						} else if (event.type === "tool_execution_start") {
 							state.toolCount++;
 							updateWidget();
+							if (onUpdate) {
+								onUpdate({
+									content: [{ type: "text", text: textChunks.join("") }],
+									details: { agent: agentName, task, status: "running", elapsed: Date.now() - startTime },
+								});
+							}
 						} else if (event.type === "message_end") {
 							const msg = event.message;
 							if (msg?.usage && contextWindow > 0) {
@@ -649,7 +661,6 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const { agent, task } = params as { agent: string; task: string };
-			console.error(`[agent-team-permodel] execute called: agent="${agent}", task="${task}"`);
 
 			try {
 				if (onUpdate) {
@@ -659,7 +670,7 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				const result = await dispatchAgent(agent, task, ctx);
+				const result = await dispatchAgent(agent, task, ctx, onUpdate);
 
 				const truncated = result.output.length > 8000
 					? result.output.slice(0, 8000) + "\n\n... [truncated]"
@@ -872,6 +883,7 @@ ${agentCatalog}`,
 
 		// Default to first team — use /agents-team to switch
 		const teamNames = Object.keys(teams);
+		setupWidget();
 		if (teamNames.length > 0) {
 			activateTeam(teamNames[0]);
 		}
