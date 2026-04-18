@@ -51,6 +51,17 @@ interface AgentState {
 	timer?: ReturnType<typeof setInterval>;
 }
 
+// ── Turn Summary Type (shared with pi-subagent-summarizer) ─
+
+interface TurnSummary {
+	turn: number;
+	agentName: string;
+	dispatcherRequest: string;
+	toolsUsed: string[];
+	modifiedFiles: string[];
+	findings: string;
+}
+
 // ── Display Name Helper ──────────────────────────
 
 function displayName(name: string): string {
@@ -155,6 +166,33 @@ function scanAgentDirs(cwd: string): AgentDef[] {
 
 	if (DEBUG_SCAN) console.error(`[agent-team] total agents found: ${agents.length}`);
 	return agents;
+}
+
+// ── Summary Instruction Formatter ────────────────
+
+function formatSummaryInstructions(turnNumber: number): string {
+	return [
+		"",
+		"═══ OUTPUT INSTRUCTIONS ═══",
+		"After completing your task, you MUST append a structured summary of your work inside a <turn> block at the very end of your output.",
+		"Format your summary EXACTLY like this (no deviations):",
+		"",
+		`<turn #${turnNumber}>`,
+		"<dispatcher-request>Brief description of what you were asked to do</dispatcher-request>",
+		"<tools-used>read, grep, edit</tools-used>",
+		"<modified-files>src/auth.ts, tests/auth.test.ts</modified-files>",
+		"<findings>Concise summary of what you discovered or accomplished</findings>",
+		`</turn>`,
+		"",
+		"Rules:",
+		"- The <turn> block MUST be the LAST thing in your output, after all other content",
+		"- <tools-used> is a comma-separated list of tools you actually used",
+		"- <modified-files> is a comma-separated list of files you modified or created",
+		"- <findings> should be concise — key insights, results, errors, or outcomes",
+		"- Do NOT include the <turn> block inside code fences or any other formatting",
+		"═══ END OUTPUT INSTRUCTIONS ═══",
+		"",
+	].join("\n");
 }
 
 // ── Extension ────────────────────────────────────
@@ -381,8 +419,9 @@ export default function (pi: ExtensionAPI) {
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: "openrouter/google/gemini-3-flash-preview");
 
-		// Ephemeral subagent mode: each dispatch gets a fresh, wiped session
-		const ephemeral = process.env.PI_EPHEMERAL_SUBAGENTS === "true";
+		// Ephemeral subagent mode: supports "true" (fresh sessions) and "summarized" (summary injection)
+		const ephemeralMode = process.env.PI_EPHEMERAL_SUBAGENTS || "false";
+		const ephemeral = ephemeralMode === "true" || ephemeralMode === "summarized";
 
 		// Session file for this agent — scoped to main orchestrator session
 		const mainSessionId = ctx.sessionManager.getSessionId();
@@ -428,6 +467,51 @@ export default function (pi: ExtensionAPI) {
 			args.push("-c");
 		}
 
+		// When in summarized mode, inject prior turn summaries + instructions into --append-system-prompt
+		if (ephemeralMode === "summarized") {
+			const summariesPath = join(sessionDir, `${mainSessionId}-${agentKey}-summaries.json`);
+			let summaries: TurnSummary[] = [];
+			if (existsSync(summariesPath)) {
+				try {
+					summaries = JSON.parse(readFileSync(summariesPath, "utf-8"));
+				} catch {}
+			}
+
+			// Find the index of --append-system-prompt to modify its value
+			const sysPromptIdx = args.indexOf("--append-system-prompt");
+			if (sysPromptIdx >= 0) {
+				let currentSystemPrompt = args[sysPromptIdx + 1] || "";
+
+				// Append prior turn summaries if any exist
+				if (summaries.length > 0) {
+					const summaryLines: string[] = [
+						"",
+						"═══ PRIOR TURN SUMMARIES ═══",
+						"You have access to summaries of prior subagent turns for context. These are compressed summaries — not full histories. Use them to understand what happened before, but investigate the current state yourself if needed.",
+						"",
+					];
+					for (const s of summaries) {
+						summaryLines.push(`<turn #${s.turn}>`);
+						summaryLines.push(`<dispatcher-request>${s.dispatcherRequest || ""}</dispatcher-request>`);
+						summaryLines.push(`<tools-used>${(s.toolsUsed || []).join(", ")}</tools-used>`);
+						summaryLines.push(`<modified-files>${(s.modifiedFiles || []).join(", ")}</modified-files>`);
+						summaryLines.push(`<findings>${s.findings || ""}</findings>`);
+						summaryLines.push(`</turn>`);
+						summaryLines.push("");
+					}
+					summaryLines.push("═══ END PRIOR TURN SUMMARIES ═══");
+					summaryLines.push("");
+					currentSystemPrompt += summaryLines.join("\n");
+				}
+
+				// Always append summary instructions when in summarized mode
+				const currentTurn = summaries.length + 1;
+				currentSystemPrompt += formatSummaryInstructions(currentTurn);
+
+				args[sysPromptIdx + 1] = currentSystemPrompt;
+			}
+		}
+
 		args.push(task);
 
 		const textChunks: string[] = [];
@@ -435,7 +519,14 @@ export default function (pi: ExtensionAPI) {
 		return new Promise((resolve) => {
 			const proc = spawn("pi", args, {
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, PI_CACHE_RETENTION: "long", PI_SUBAGENT: "1" },
+				env: {
+				...process.env,
+				PI_CACHE_RETENTION: "long",
+				PI_SUBAGENT: "1",
+				// In summarized mode, subagent uses ephemeral sessions (fresh each time)
+				// so it starts clean but receives prior context via system prompt
+				...(ephemeralMode === "summarized" ? { PI_EPHEMERAL_SUBAGENTS: "true" } : {}),
+			},
 			});
 
 			let buffer = "";
@@ -752,9 +843,11 @@ ${agentCatalog}`,
 
 		// Wipe old agent session files so subagents start fresh
 		// Controlled by PI_EPHEMERAL_SUBAGENTS env var:
-		//   true  — wipe on boot + each dispatch gets a fresh session (no cross-dispatch context)
-		//   false — preserve session history for cross-run cache reuse (default)
-		const ephemeral = process.env.PI_EPHEMERAL_SUBAGENTS === "true";
+		//   true       — wipe on boot + each dispatch gets a fresh session (no cross-dispatch context)
+		//   summarized — same as true, plus summary injection into system prompt
+		//   false      — preserve session history for cross-run cache reuse (default)
+		const ephemeralMode = process.env.PI_EPHEMERAL_SUBAGENTS || "false";
+		const ephemeral = ephemeralMode === "true" || ephemeralMode === "summarized";
 		if (ephemeral) {
 			const sessDir = join(_ctx.cwd, ".pi", "agent-sessions");
 			if (existsSync(sessDir)) {

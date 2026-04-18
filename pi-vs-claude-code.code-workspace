@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../.pi"
+		},
+		{
+			"path": "../../.config/opencode"
+		},
+		{
+			"path": "../litellm"
+		}
+	],
+	"settings": {}
+}
