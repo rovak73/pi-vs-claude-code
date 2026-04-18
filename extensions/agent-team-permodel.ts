@@ -214,8 +214,8 @@ export default function (pi: ExtensionAPI) {
 	let contextWindow = 0;
 
 	function loadAgents(cwd: string) {
-		// Create session storage dir
-		sessionDir = join(cwd, ".pi", "agent-sessions");
+		// Create session storage dir in global ~/.pi/agent-sessions
+		sessionDir = join(homedir(), ".pi", "agent-sessions");
 		if (!existsSync(sessionDir)) {
 			mkdirSync(sessionDir, { recursive: true });
 		}
@@ -384,6 +384,7 @@ export default function (pi: ExtensionAPI) {
 		ctx: any,
 	): Promise<{ output: string; exitCode: number; elapsed: number }> {
 		const key = agentName.toLowerCase();
+		console.error(`[agent-team-permodel] dispatchAgent called: agent="${agentName}", key="${key}", available=[${Array.from(agentStates.keys()).join(", ")}], EPHEMERAL_SUBAGENTS="${process.env.PI_EPHEMERAL_SUBAGENTS}"`);
 		const state = agentStates.get(key);
 		if (!state) {
 			return Promise.resolve({
@@ -422,6 +423,7 @@ export default function (pi: ExtensionAPI) {
 		// Ephemeral subagent mode: supports "true" (fresh sessions) and "summarized" (summary injection)
 		const ephemeralMode = process.env.PI_EPHEMERAL_SUBAGENTS || "false";
 		const ephemeral = ephemeralMode === "true" || ephemeralMode === "summarized";
+		console.error(`[agent-team-permodel] PI_EPHEMERAL_SUBAGENTS="${process.env.PI_EPHEMERAL_SUBAGENTS ?? "(unset)"}", ephemeralMode="${ephemeralMode}", ephemeral=${ephemeral}`);
 
 		// Session file for this agent — scoped to main orchestrator session
 		const mainSessionId = ctx.sessionManager.getSessionId();
@@ -468,17 +470,22 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// When in summarized mode, inject prior turn summaries + instructions into --append-system-prompt
+		console.error(`[agent-team-permodel] about to check ephemeralMode: "${ephemeralMode}"`);
 		if (ephemeralMode === "summarized") {
+			console.error(`[agent-team-permodel] entered summarized branch for agent "${agentName}"`);
 			const summariesPath = join(sessionDir, `${mainSessionId}-${agentKey}-summaries.json`);
+			console.error(`[agent-team-permodel] summariesPath=${summariesPath}`);
 			let summaries: TurnSummary[] = [];
 			if (existsSync(summariesPath)) {
 				try {
 					summaries = JSON.parse(readFileSync(summariesPath, "utf-8"));
 				} catch {}
 			}
+			console.error(`[agent-team-permodel] found ${summaries.length} summaries at ${summariesPath}`);
 
 			// Find the index of --append-system-prompt to modify its value
 			const sysPromptIdx = args.indexOf("--append-system-prompt");
+			console.error(`[agent-team-permodel] --append-system-prompt found in args: ${sysPromptIdx >= 0}`);
 			if (sysPromptIdx >= 0) {
 				let currentSystemPrompt = args[sysPromptIdx + 1] || "";
 
@@ -509,6 +516,7 @@ export default function (pi: ExtensionAPI) {
 				currentSystemPrompt += formatSummaryInstructions(currentTurn);
 
 				args[sysPromptIdx + 1] = currentSystemPrompt;
+				console.error(`[agent-team-permodel] system prompt modified, final length=${currentSystemPrompt.length}`);
 			}
 		}
 
@@ -641,6 +649,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const { agent, task } = params as { agent: string; task: string };
+			console.error(`[agent-team-permodel] execute called: agent="${agent}", task="${task}"`);
 
 			try {
 				if (onUpdate) {
@@ -849,10 +858,10 @@ ${agentCatalog}`,
 		const ephemeralMode = process.env.PI_EPHEMERAL_SUBAGENTS || "false";
 		const ephemeral = ephemeralMode === "true" || ephemeralMode === "summarized";
 		if (ephemeral) {
-			const sessDir = join(_ctx.cwd, ".pi", "agent-sessions");
+			const sessDir = join(homedir(), ".pi", "agent-sessions");
 			if (existsSync(sessDir)) {
 				for (const f of readdirSync(sessDir)) {
-					if (f.endsWith(".json")) {
+					if (f.endsWith(".json") && !f.endsWith("-summaries.json")) {
 						try { unlinkSync(join(sessDir, f)); } catch {}
 					}
 				}
