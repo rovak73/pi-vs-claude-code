@@ -23,7 +23,8 @@ import { Text, type AutocompleteItem, truncateToWidth, visibleWidth } from "@mar
 import { spawn } from "child_process";
 import { readdirSync, readFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
 import { homedir } from "node:os";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
+import { fileURLToPath } from "url";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
 // ── Types ────────────────────────────────────────
@@ -159,6 +160,12 @@ function scanAgentDirs(cwd: string): AgentDef[] {
 // ── Extension ────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	// Prevent this orchestrator from running inside subagents
+	// (defense-in-depth alongside --no-extensions in spawn args)
+	if (process.env.PI_SUBAGENT === "1") {
+		return;
+	}
+
 	const agentStates: Map<string, AgentState> = new Map();
 	let allAgentDefs: AgentDef[] = [];
 	let teams: Record<string, string[]> = {};
@@ -379,6 +386,19 @@ export default function (pi: ExtensionAPI) {
 		const agentKey = state.def.name.toLowerCase().replace(/\s+/g, "-");
 		const agentSessionFile = join(sessionDir, `${mainSessionId}-${agentKey}.json`);
 
+		// Resolve pi-rtk-optimizer path: check sibling in extensions/, then git/ installed packages
+		function resolveOptimizerPath(): string | null {
+			const thisDir = dirname(fileURLToPath(import.meta.url));
+			const candidates = [
+				join(thisDir, "..", "pi-rtk-optimizer", "index.ts"),
+				join(homedir(), ".pi", "agent", "git", "github.com", "MasuRii", "pi-rtk-optimizer", "index.ts"),
+			];
+			for (const p of candidates) {
+				if (existsSync(p)) return p;
+			}
+			return null;
+		}
+
 		// Build args — first run creates session, subsequent runs resume
 		const args = [
 			"--mode", "json",
@@ -390,6 +410,13 @@ export default function (pi: ExtensionAPI) {
 			"--append-system-prompt", state.def.systemPrompt,
 			"--session", agentSessionFile,
 		];
+
+		// Enable pi-rtk-optimizer in subagents while keeping auto-discovery off
+		// to prevent infinite orchestrator recursion
+		const optimizerPath = resolveOptimizerPath();
+		if (optimizerPath) {
+			args.push("-e", optimizerPath);
+		}
 
 		// Continue existing session if we have one
 		if (state.sessionFile) {
@@ -403,7 +430,7 @@ export default function (pi: ExtensionAPI) {
 		return new Promise((resolve) => {
 			const proc = spawn("pi", args, {
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, PI_CACHE_RETENTION: "long" },
+				env: { ...process.env, PI_CACHE_RETENTION: "long", PI_SUBAGENT: "1" },
 			});
 
 			let buffer = "";
