@@ -381,10 +381,15 @@ export default function (pi: ExtensionAPI) {
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: "openrouter/google/gemini-3-flash-preview");
 
+		// Ephemeral subagent mode: each dispatch gets a fresh, wiped session
+		const ephemeral = process.env.PI_EPHEMERAL_SUBAGENTS === "true";
+
 		// Session file for this agent — scoped to main orchestrator session
 		const mainSessionId = ctx.sessionManager.getSessionId();
 		const agentKey = state.def.name.toLowerCase().replace(/\s+/g, "-");
-		const agentSessionFile = join(sessionDir, `${mainSessionId}-${agentKey}.json`);
+		const agentSessionFile = ephemeral
+			? join(sessionDir, `${mainSessionId}-${agentKey}-${Date.now()}.json`)
+			: join(sessionDir, `${mainSessionId}-${agentKey}.json`);
 
 		// Resolve pi-rtk-optimizer path: check sibling in extensions/, then git/ installed packages
 		function resolveOptimizerPath(): string | null {
@@ -418,8 +423,8 @@ export default function (pi: ExtensionAPI) {
 			args.push("-e", optimizerPath);
 		}
 
-		// Continue existing session if we have one
-		if (state.sessionFile) {
+		// Continue existing session if we have one (skip in ephemeral mode)
+		if (!ephemeral && state.sessionFile) {
 			args.push("-c");
 		}
 
@@ -492,9 +497,14 @@ export default function (pi: ExtensionAPI) {
 				state.elapsed = Date.now() - startTime;
 				state.status = code === 0 ? "done" : "error";
 
-				// Mark session file as available for resume
-				if (code === 0) {
+				// Mark session file as available for resume (skip in ephemeral mode)
+				if (code === 0 && !ephemeral) {
 					state.sessionFile = agentSessionFile;
+				}
+
+				// Clean up ephemeral session file after use
+				if (ephemeral && existsSync(agentSessionFile)) {
+					try { unlinkSync(agentSessionFile); } catch {}
 				}
 
 				const full = textChunks.join("");
@@ -741,16 +751,20 @@ ${agentCatalog}`,
 		contextWindow = _ctx.model?.contextWindow || 0;
 
 		// Wipe old agent session files so subagents start fresh
-		// DISABLED: preserving session history allows subagents to reuse
-		// cache across orchestrator runs, improving LLM provider cache hit rates.
-		// const sessDir = join(_ctx.cwd, ".pi", "agent-sessions");
-		// if (existsSync(sessDir)) {
-		// 	for (const f of readdirSync(sessDir)) {
-		// 		if (f.endsWith(".json")) {
-		// 			try { unlinkSync(join(sessDir, f)); } catch {}
-		// 		}
-		// 	}
-		// }
+		// Controlled by PI_EPHEMERAL_SUBAGENTS env var:
+		//   true  — wipe on boot + each dispatch gets a fresh session (no cross-dispatch context)
+		//   false — preserve session history for cross-run cache reuse (default)
+		const ephemeral = process.env.PI_EPHEMERAL_SUBAGENTS === "true";
+		if (ephemeral) {
+			const sessDir = join(_ctx.cwd, ".pi", "agent-sessions");
+			if (existsSync(sessDir)) {
+				for (const f of readdirSync(sessDir)) {
+					if (f.endsWith(".json")) {
+						try { unlinkSync(join(sessDir, f)); } catch {}
+					}
+				}
+			}
+		}
 
 		loadAgents(_ctx.cwd);
 
