@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../litellm"
+		},
+		{
+			"path": "../tmp/opencode-antigravity-auth"
 		}
 	],
 	"settings": {}
